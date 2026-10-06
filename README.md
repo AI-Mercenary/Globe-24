@@ -16,6 +16,7 @@ A real-time 3D globe built with three.js. All data is live and from public sourc
   - Current weather at that spot (Open-Meteo)
 - **Live layers**: earthquakes (USGS, last 24 h), natural events (NASA EONET), satellites and the ISS with its orbit (CelesTrak + SGP4)
 - **World clocks**: 90 cities grouped by continent
+- **Borders, states and districts**: country borders from Natural Earth v5.1.2, with an India point-of-view option (official boundaries; automatic for viewers in India). Click or locate a country to load its states/provinces and districts from geoBoundaries. India's 36 states/UTs and 735 districts ship with the site (LGD 2021 / Election Commission of India)
 - **Country locator**: 242 countries with flags, capital, population, currency, languages and local time
 - **Around the world**: rotating real imagery of random places
 - **Tools**: great-circle measurement, MGRS coordinates, coordinate/place search, cinematic camera flights
@@ -39,4 +40,4 @@ No API keys are needed.
 
 ## Data sources
 
-Esri World Imagery · NASA GIBS (VIIRS, HLS, GOES, Himawari) · USGS Earthquake Hazards · NASA EONET · CelesTrak · Natural Earth · Open-Meteo · OpenStreetMap Nominatim · mledoze/countries · World Bank · flagcdn
+Esri World Imagery · geoBoundaries · NASA GIBS (VIIRS, HLS, GOES, Himawari) · USGS Earthquake Hazards · NASA EONET · CelesTrak · Natural Earth · Open-Meteo · OpenStreetMap Nominatim · mledoze/countries · World Bank · flagcdn

@@ -415,7 +415,13 @@ let countries = [];
 const hiMat = new THREE.LineBasicMaterial({ color:0xffb800 });
 let hiLine = null, hiName = null;
 const ringToLine = (ring, r) => { const pts = []; ring.forEach(([lo, la]) => pts.push(toVec(la, lo, r))); return pts; };
-fetch('https://cdn.jsdelivr.net/gh/nvkelso/natural-earth-vector@v5.1.2/geojson/ne_50m_admin_0_countries.geojson')
+// border point of view: international (Natural Earth default) or India's official boundaries
+function borderView(){
+  let v = 'auto'; try { v = localStorage.getItem('ops.borderView') || 'auto'; } catch {}
+  if (v !== 'auto') return v;
+  return /Calcutta|Kolkata/.test(Intl.DateTimeFormat().resolvedOptions().timeZone) ? 'india' : 'intl';
+}
+fetch(borderView() === 'india' ? 'data/countries-ind.geojson' : 'https://cdn.jsdelivr.net/gh/nvkelso/natural-earth-vector@v5.1.2/geojson/ne_50m_admin_0_countries.geojson')
   .then(r => r.json()).then(geo => {
     const seg = [];
     geo.features.forEach(f => {
@@ -627,7 +633,8 @@ function onHover(e){
   lastHover = ll; const [la, lo] = ll, c = countryAt(la, lo);
   highlight(c); placePin(hoverPin, la, lo);
   tip.style.display = 'block'; tip.style.left = e.clientX+'px'; tip.style.top = e.clientY+'px';
-  tip.innerHTML = `<b>${c ? c.name.toUpperCase() : 'OCEAN / NO TERRITORY'}</b><br>${fmt(la,'N','S')} · ${fmt(lo,'E','W')}`;
+  const adm = c ? adminAt(c, la, lo) : null;
+  tip.innerHTML = `<b>${c ? c.name.toUpperCase() : 'OCEAN / NO TERRITORY'}</b>${adm ? `<br>${[adm.d, adm.s].filter(Boolean).join(' · ')}` : ''}<br>${fmt(la,'N','S')} · ${fmt(lo,'E','W')}`;
   $('cCountry').textContent = c ? c.name : '—'; $('cLat').textContent = fmt(la,'N','S'); $('cLon').textContent = fmt(lo,'E','W');
   $('cSolar').textContent = solar(lo); statusMgrs(la, lo);
 }
@@ -643,7 +650,7 @@ canvas.addEventListener('pointerup', e => {
 function select(la, lo, zoom){
   lastPick = [la, lo]; placePin(clickPin, la, lo);
   focus = toVec(la, lo).normalize().multiplyScalar(Math.min(camera.position.length(), 260));
-  const c = countryAt(la, lo);
+  const c = countryAt(la, lo); if (c) loadAdmin(c);
   log(`<b>SELECT</b> ${la.toFixed(4)}, ${lo.toFixed(4)}${c ? ' · ' + c.name : ''}`);
   openImagery(la, lo, zoom); updateSats();
 }
@@ -1704,7 +1711,7 @@ function countryView(c){
 let lockedCountry = null;
 async function locateCountry(c){
   if (!c) return;
-  const v = countryView(c); lockedCountry = c; highlight(c); placePin(clickPin, v.la, v.lo);
+  const v = countryView(c); lockedCountry = c; highlight(c); placePin(clickPin, v.la, v.lo); loadAdmin(c);
   focus = toVec(v.la, v.lo).normalize().multiplyScalar(v.dist);
   log(`<b>LOCATE</b> ${c.name}`);
   const f = countryMeta(c);
@@ -1767,6 +1774,66 @@ if (mobileMQ.matches) { pr = Math.min(pr, 1.25); renderer.setPixelRatio(pr); }
 function fitGlobe(){ const a = innerWidth/innerHeight; controls.maxDistance = a < 1 ? 760 : 600;
   if (a < 1 && !flight && camera.position.length() < 300/a*0.8) camera.position.setLength(Math.min(720, 330/a*0.82)); }
 fitGlobe(); addEventListener('resize', fitGlobe);
+
+// ---- states / provinces / districts: geoBoundaries (India shipped locally, others on demand) ----
+const adminGroup = new THREE.Group(); globe.add(adminGroup);
+const adminCache = {};                       // iso3 -> { adm1:[], adm2:[], obj }
+const plain = t => (t || '').normalize('NFD').replace(/[\u0300-\u036f]/g, '');
+function adminFeatures(geo){
+  return geo.features.map(f => {
+    const polys = f.geometry.type === 'Polygon' ? [f.geometry.coordinates] : f.geometry.coordinates;
+    let b = [180, 90, -180, -90];
+    for (const p of polys) for (const [x, y] of p[0]) b = [Math.min(b[0], x), Math.min(b[1], y), Math.max(b[2], x), Math.max(b[3], y)];
+    return { name:plain(f.properties.shapeName), polys, b };
+  });
+}
+function adminLines(feats, r){
+  const seg = [];
+  for (const f of feats) for (const p of f.polys) { const pts = ringToLine(p[0], R*r); for (let i = 1; i < pts.length; i++) seg.push(pts[i-1], pts[i]); }
+  return new THREE.BufferGeometry().setFromPoints(seg);
+}
+async function fetchAdm(iso3, level){
+  if (iso3 === 'IND') return (await fetch(`data/IND-${level}.geojson`)).json();
+  const meta = await (await fetch(`https://www.geoboundaries.org/api/current/gbOpen/${iso3}/${level}/`)).json();
+  if (level === 'ADM2' && +meta.admUnitCount > 2000) return null;               // too heavy for a browser globe
+  const url = meta.simplifiedGeometryGeoJSON.replace('https://github.com/wmgeolab/geoBoundaries/raw/', 'https://media.githubusercontent.com/media/wmgeolab/geoBoundaries/');
+  const g = await (await fetch(url)).json(); g.year = meta.boundaryYearRepresented; g.src = meta.boundarySource; return g;
+}
+let adminLoading = null;
+async function loadAdmin(c){
+  if (!layerOn.admin) return;
+  const iso3 = ctyFacts[c.iso]?.cca3; if (!iso3) return;
+  for (const k in adminCache) if (adminCache[k].obj) adminCache[k].obj.visible = k === iso3;
+  if (adminCache[iso3] || adminLoading === iso3) return;
+  adminLoading = iso3; log(`<b>ADMIN</b> loading ${c.name} states & districts…`);
+  try {
+    const [g1, g2] = await Promise.all([fetchAdm(iso3, 'ADM1').catch(() => null), fetchAdm(iso3, 'ADM2').catch(() => null)]);
+    const entry = { adm1:g1 ? adminFeatures(g1) : [], adm2:g2 ? adminFeatures(g2) : [], obj:new THREE.Group() };
+    if (entry.adm2.length) entry.obj.add(new THREE.LineSegments(adminLines(entry.adm2, 1.0041), new THREE.LineBasicMaterial({ color:0xffffff, transparent:true, opacity:0.16 })));
+    if (entry.adm1.length) entry.obj.add(new THREE.LineSegments(adminLines(entry.adm1, 1.0043), new THREE.LineBasicMaterial({ color:0xe8eef5, transparent:true, opacity:0.5 })));
+    adminCache[iso3] = entry; adminGroup.add(entry.obj);
+    for (const k in adminCache) adminCache[k].obj.visible = k === iso3;
+    const yr = g2?.year || g1?.year;
+    log(`<b>ADMIN</b> ${c.name}: ${entry.adm1.length} states/provinces · ${entry.adm2.length} districts${iso3 === 'IND' ? ' (LGD 2021 / ECI)' : yr ? ` (${yr})` : ''}`);
+  } catch { log(`<b>ADMIN</b> ${c.name}: boundaries unavailable`); }
+  adminLoading = null;
+}
+function adminAt(c, la, lo){
+  if (!layerOn.admin) return null;
+  const e = adminCache[ctyFacts[c.iso]?.cca3]; if (!e) return null;
+  const hit = list => list.find(f => lo >= f.b[0] && lo <= f.b[2] && la >= f.b[1] && la <= f.b[3] && f.polys.some(p => inRing(lo, la, p[0])));
+  const d = hit(e.adm2), st = hit(e.adm1);
+  return d || st ? { d:d?.name, s:st?.name } : null;
+}
+LAYERS.push({ id:'admin', name:'States & districts', col:'#e8eef5', get:() => adminGroup });
+if (!('admin' in layerOn)) layerOn.admin = true;
+renderLayers();
+// border point-of-view selector (Filters panel)
+optPanel.querySelector('.pb').insertAdjacentHTML('afterbegin', `<label class="row"><span class="k">Border view</span><select id="oBorder" class="sel">
+  <option value="auto">Automatic (by your region)</option><option value="intl">International (de facto)</option><option value="india">India (official boundaries)</option></select></label>`);
+try { $('oBorder').value = localStorage.getItem('ops.borderView') || 'auto'; } catch {}
+$('oBorder').onchange = e => { try { localStorage.setItem('ops.borderView', e.target.value); } catch {} location.reload(); };
+optPanel.querySelector('h3').innerHTML = 'Settings <em>borders · satellites</em>';
 
 updateSun();
 log('<b>BOOT</b> online · click the globe for imagery, or an event for details');
