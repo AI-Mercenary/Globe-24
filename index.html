@@ -142,6 +142,11 @@
   #clockList details[open] summary::before { transform:rotate(90deg) }
   #clockList summary > span { flex:1; white-space:nowrap } #clockList summary em { font:400 9.5px var(--mono); color:var(--tx3); font-style:normal; white-space:nowrap }
   #clockList summary:hover { background:#ffffff06 } #clockList .clk { padding-left:26px } #clockList .clk.me .cn::after { content:' · you'; color:var(--b); font-weight:400 }
+  #wxLegend { position:fixed; z-index:6; left:286px; bottom:36px; display:none; background:var(--panel); border:1px solid var(--line); border-radius:6px; padding:8px 10px; width:230px }
+  #wxLegend .lg + .lg { margin-top:8px } #wxLegend span { font:500 10.5px var(--sans); color:var(--tx2) }
+  #wxLegend i { display:block; height:7px; border-radius:3px; margin:5px 0 3px }
+  #wxLegend b { display:flex; justify-content:space-between; font:400 9.5px var(--mono); color:var(--tx3) } #wxLegend em { font-style:normal }
+  @media (max-width:860px) { #wxLegend { left:8px; bottom:36px; width:200px } }
   #card h4 { font:600 14px var(--sans); margin-bottom:6px } #card a { color:var(--b); text-decoration:none }
 
   /* imagery viewer */
@@ -1474,6 +1479,7 @@ function statusMgrs(la, lo){ try { $('cMgrs').textContent = mgrsLib && Math.abs(
 // ---- per-frame ----
 let lastAlt = 0;
 function opsFrame(t){
+  if (typeof windFrame === 'function') windFrame();
   const zs = THREE.MathUtils.clamp(camera.position.length()/300, 0.2, 1);   // markers shrink as you zoom in
   if (Math.abs(zs - (opsFrame.zs || 0)) > 0.01) { opsFrame.zs = zs; for (const q of quakes) q.obj.scale.setScalar(zs); natGroup.children.forEach(o => o.isMesh && o.scale.setScalar(zs)); }
   for (const q of quakes) { const r = q.obj.userData.ring; if (!r) continue;
@@ -1834,6 +1840,163 @@ optPanel.querySelector('.pb').insertAdjacentHTML('afterbegin', `<label class="ro
 try { $('oBorder').value = localStorage.getItem('ops.borderView') || 'auto'; } catch {}
 $('oBorder').onchange = e => { try { localStorage.setItem('ops.borderView', e.target.value); } catch {} location.reload(); };
 optPanel.querySelector('h3').innerHTML = 'Settings <em>borders · satellites</em>';
+
+// =====================================================================
+//  LIVE WEATHER: temperature map, wind flow (Open-Meteo), precipitation radar (RainViewer)
+// =====================================================================
+const WX_STEP = 10, WX_LATS = [], WX_LONS = [];
+for (let la = -80; la <= 80; la += WX_STEP) WX_LATS.push(la);
+for (let lo = -180; lo < 180; lo += WX_STEP) WX_LONS.push(lo);
+let wxg = null, wxLoading = null, wxTime = '';              // wxg = { T, U, V } grids [lat][lon]
+
+async function loadWxGrid(){
+  if (wxLoading) return wxLoading;
+  return wxLoading = (async () => {
+    try {   // cached 30 min so reloads don't re-spend the free quota
+      const c = JSON.parse(localStorage.getItem('ops.wxgrid'));
+      if (c && Date.now() - c.t < 30*6e4) { wxg = c.g; wxTime = c.time; return wxg; }
+    } catch {}
+    const pts = WX_LATS.flatMap(la => WX_LONS.map(lo => [la, lo])), out = [];
+    for (let i = 0; i < pts.length; i += 160) {
+      const chunk = pts.slice(i, i + 160);
+      const url = `https://api.open-meteo.com/v1/forecast?latitude=${chunk.map(p => p[0]).join(',')}&longitude=${chunk.map(p => p[1]).join(',')}&current=temperature_2m,wind_speed_10m,wind_direction_10m&wind_speed_unit=ms`;
+      const r = await fetch(url); if (!r.ok) throw new Error(r.status);
+      out.push(...await r.json());
+    }
+    const T = [], U = [], V = [];
+    WX_LATS.forEach((_, i) => { T[i] = []; U[i] = []; V[i] = [];
+      WX_LONS.forEach((_, j) => { const c = out[i*WX_LONS.length + j].current, d = c.wind_direction_10m*Math.PI/180;
+        T[i][j] = c.temperature_2m; U[i][j] = -c.wind_speed_10m*Math.sin(d); V[i][j] = -c.wind_speed_10m*Math.cos(d); }); });
+    wxg = { T, U, V }; wxTime = out[0].current.time + 'Z';
+    try { localStorage.setItem('ops.wxgrid', JSON.stringify({ t:Date.now(), g:wxg, time:wxTime })); } catch {}
+    log(`<b>WEATHER</b> ${pts.length} grid points · ${wxTime.slice(11, 16)} UTC`);
+    return wxg;
+  })().finally(() => { wxLoading = null; });
+}
+// bilinear sample of a grid at any lat/lon (longitude wraps)
+function wxAt(G, la, lo){
+  const fi = THREE.MathUtils.clamp((la + 80)/WX_STEP, 0, WX_LATS.length - 1.001), fj = ((lo + 180)/WX_STEP) % WX_LONS.length;
+  const i = Math.floor(fi), j = Math.floor(fj), di = fi - i, dj = fj - j, j1 = (j + 1) % WX_LONS.length;
+  return (G[i][j]*(1-dj) + G[i][j1]*dj)*(1-di) + (G[i+1][j]*(1-dj) + G[i+1][j1]*dj)*di;
+}
+const wxShell = r => { const m = new THREE.Mesh(new THREE.SphereGeometry(R*r, 96, 72),
+  new THREE.MeshBasicMaterial({ transparent:true, depthWrite:false, opacity:0.6 })); m.visible = false; globe.add(m); return m; };
+
+// ---- temperature map ----
+const TEMP_STOPS = [[-40,'#3b1c6e'],[-25,'#3949ab'],[-10,'#1e88e5'],[0,'#4fc3f7'],[10,'#a5d6a7'],[20,'#ffee58'],[30,'#ff9800'],[40,'#e53935'],[48,'#8e0000']];
+const tempRGB = (() => { const c = document.createElement('canvas'); c.width = 256; c.height = 1; const g = c.getContext('2d');
+  const gr = g.createLinearGradient(0, 0, 256, 0); TEMP_STOPS.forEach(([t, col]) => gr.addColorStop((t + 40)/88, col));
+  g.fillStyle = gr; g.fillRect(0, 0, 256, 1); return g.getImageData(0, 0, 256, 1).data; })();
+const tempMesh = wxShell(1.0026);
+function buildTemp(){
+  const W = 360, H = 180, c = document.createElement('canvas'); c.width = W; c.height = H;
+  const g = c.getContext('2d'), img = g.createImageData(W, H);
+  for (let y = 0; y < H; y++) { const la = 90 - (y + 0.5);
+    for (let x = 0; x < W; x++) { const t = wxAt(wxg.T, la, x - 180 + 0.5), k = Math.round(THREE.MathUtils.clamp((t + 40)/88, 0, 1)*255)*4, o = (y*W + x)*4;
+      img.data[o] = tempRGB[k]; img.data[o+1] = tempRGB[k+1]; img.data[o+2] = tempRGB[k+2]; img.data[o+3] = 255; } }
+  g.putImageData(img, 0, 0);
+  const big = document.createElement('canvas'); big.width = 1440; big.height = 720;
+  const bg = big.getContext('2d'); bg.imageSmoothingQuality = 'high'; bg.drawImage(c, 0, 0, 1440, 720);
+  const tex = new THREE.CanvasTexture(big); tex.colorSpace = THREE.SRGBColorSpace;
+  tempMesh.material.map?.dispose(); tempMesh.material.map = tex; tempMesh.material.opacity = 0.42; tempMesh.material.needsUpdate = true;
+}
+
+// ---- wind flow: particles advected through the live wind field ----
+const WIND_N = 3500;
+const windGeo = new THREE.BufferGeometry();
+windGeo.setAttribute('position', new THREE.BufferAttribute(new Float32Array(WIND_N*6), 3));
+windGeo.setAttribute('color', new THREE.BufferAttribute(new Float32Array(WIND_N*6), 3));
+const windLines = new THREE.LineSegments(windGeo, new THREE.LineBasicMaterial({ vertexColors:true, transparent:true, opacity:0.85, depthWrite:false }));
+windLines.visible = false; globe.add(windLines);
+const wp = Array.from({ length:WIND_N }, () => ({ la:0, lo:0, age:0, life:0 }));
+const respawn = p => { p.la = Math.asin(Math.random()*2 - 1)*180/Math.PI*0.95; p.lo = Math.random()*360 - 180; p.age = 0; p.life = 3 + Math.random()*5; };
+wp.forEach(p => { respawn(p); p.age = Math.random()*p.life; });
+const _wc = new THREE.Color();
+let wLast = performance.now();
+function windFrame(){
+  const now = performance.now(), dt = Math.min((now - wLast)/1000, 0.05); wLast = now;
+  if (!windLines.visible || !wxg) return;
+  const pos = windGeo.attributes.position.array, col = windGeo.attributes.color.array;
+  for (let i = 0; i < WIND_N; i++) {
+    const p = wp[i]; p.age += dt;
+    const u = wxAt(wxg.U, p.la, p.lo), v = wxAt(wxg.V, p.la, p.lo), sp = Math.hypot(u, v);
+    const cl = Math.max(0.15, Math.cos(p.la*Math.PI/180));
+    p.la += v*dt*0.35; p.lo += u*dt*0.35/cl;
+    if (p.lo > 180) p.lo -= 360; if (p.lo < -180) p.lo += 360;
+    if (p.age > p.life || Math.abs(p.la) > 82) respawn(p);
+    const a = toVec(p.la, p.lo, R*1.006), b = toVec(p.la - v*0.09, p.lo - u*0.09/cl, R*1.006);   // short streak behind the particle
+    pos.set([a.x, a.y, a.z, b.x, b.y, b.z], i*6);
+    const fade = Math.min(1, p.age*2, (p.life - p.age)*2);
+    _wc.setHSL(0.58 - Math.min(sp, 25)/25*0.58, 0.85, 0.55 + 0.25*fade).multiplyScalar(fade);
+    col.set([_wc.r, _wc.g, _wc.b, _wc.r*0.2, _wc.g*0.2, _wc.b*0.2], i*6);
+  }
+  windGeo.attributes.position.needsUpdate = true; windGeo.attributes.color.needsUpdate = true;
+}
+
+// ---- precipitation radar: RainViewer (latest 10-minute frame), reprojected onto the globe ----
+const radarMesh = wxShell(1.003);
+let radarTime = '';
+async function loadRadar(){
+  try {
+    const j = await (await fetch('https://api.rainviewer.com/public/weather-maps.json')).json();
+    const f = j.radar.past.at(-1), z = 3, n = 2**z, S = n*256;
+    const merc = document.createElement('canvas'); merc.width = merc.height = S; const mg = merc.getContext('2d');
+    await Promise.all(Array.from({ length:n*n }, (_, k) => new Promise(res => {
+      const x = k % n, y = Math.floor(k/n), im = new Image(); im.crossOrigin = 'anonymous';
+      im.onload = () => { mg.drawImage(im, x*256, y*256); res(); }; im.onerror = res;
+      im.src = `${j.host}${f.path}/256/${z}/${x}/${y}/2/1_1.png`; })));
+    const W = 2048, H = 1024, eq = document.createElement('canvas'); eq.width = W; eq.height = H; const eg = eq.getContext('2d');
+    for (let y = 0; y < H; y++) {      // Web Mercator rows → equirectangular rows
+      const la = 90 - (y + 0.5)/H*180; if (Math.abs(la) > 85) continue;
+      const s = Math.sin(la*Math.PI/180), my = (0.5 - Math.log((1 + s)/(1 - s))/(4*Math.PI))*S;
+      eg.drawImage(merc, 0, my, S, 1, 0, y, W, 1);
+    }
+    const tex = new THREE.CanvasTexture(eq); tex.colorSpace = THREE.SRGBColorSpace;
+    radarMesh.material.map?.dispose(); radarMesh.material.map = tex; radarMesh.material.opacity = 0.9; radarMesh.material.needsUpdate = true;
+    radarTime = new Date(f.time*1000).toISOString().slice(11, 16);
+    log(`<b>RADAR</b> precipitation frame ${radarTime} UTC`); updateLegend();
+  } catch { log('<b>RADAR</b> unavailable right now'); }
+}
+
+// ---- legend ----
+const legend = document.createElement('div'); legend.id = 'wxLegend'; document.body.appendChild(legend);
+function updateLegend(){
+  const parts = [];
+  if (layerOn.wxTemp) parts.push(`<div class="lg"><span>Temperature · 2 m ${wxTime ? '· ' + wxTime.slice(11, 16) + ' UTC' : ''}</span>
+    <i style="background:linear-gradient(90deg,${TEMP_STOPS.map(([t, c]) => `${c} ${((t + 40)/88*100).toFixed(0)}%`).join(',')})"></i>
+    <b><em>−40°</em><em>−10°</em><em>0°</em><em>20°</em><em>40°C</em></b></div>`);
+  if (layerOn.wxWind) parts.push(`<div class="lg"><span>Wind · 10 m</span><i style="background:linear-gradient(90deg,hsl(209,85%,60%),hsl(120,85%,60%),hsl(60,85%,60%),hsl(0,85%,60%))"></i><b><em>calm</em><em>10 m/s</em><em>25+ m/s</em></b></div>`);
+  if (layerOn.wxRadar) parts.push(`<div class="lg"><span>Precipitation radar ${radarTime ? '· ' + radarTime + ' UTC' : ''}</span><i style="background:linear-gradient(90deg,#88ddee,#0099cc,#ffee00,#ff7700,#cc0000,#ff00ff)"></i><b><em>light</em><em>moderate</em><em>heavy</em></b></div>`);
+  legend.innerHTML = parts.join(''); legend.style.display = parts.length ? 'block' : 'none';
+}
+
+// ---- layer wiring ----
+LAYERS.push(
+  { id:'wxTemp',  name:'Temperature (live)',   col:'#ff9800', get:() => tempMesh.material.map ? tempMesh : null,  off:true },
+  { id:'wxWind',  name:'Wind flow (live)',     col:'#4fc3f7', get:() => windLines,  off:true },
+  { id:'wxRadar', name:'Precipitation radar',  col:'#0099cc', get:() => radarMesh.material.map ? radarMesh : null, off:true });
+for (const id of ['wxTemp', 'wxWind', 'wxRadar']) if (!(id in layerOn)) layerOn[id] = false;
+async function ensureWeather(){
+  if ((layerOn.wxTemp || layerOn.wxWind) && !wxg) { await loadWxGrid().catch(() => log('<b>WEATHER</b> grid unavailable right now')); }
+  if (layerOn.wxTemp && wxg && !tempMesh.material.map) buildTemp();
+  if (layerOn.wxRadar && !radarMesh.material.map) await loadRadar();
+  applyLayers(); updateLegend();
+}
+$('lyrList').addEventListener('change', e => { if (/^wxg/.test(e.target.dataset.l || '')) ensureWeather(); });
+renderLayers(); ensureWeather();
+setInterval(async () => { if (!layerOn.wxTemp && !layerOn.wxWind) return; wxg = null; try { localStorage.removeItem('ops.wxgrid'); } catch {}
+  await loadWxGrid().catch(() => {}); if (wxg && layerOn.wxTemp) buildTemp(); updateLegend(); }, 30*6e4);
+setInterval(() => { if (layerOn.wxRadar) loadRadar(); }, 10*6e4);
+
+// hover: show the sampled temperature and wind under the cursor
+const _onHoverWx = onHover;
+onHover = e => {
+  _onHoverWx(e);
+  if (!wxg || !lastHover || !(layerOn.wxTemp || layerOn.wxWind)) return;
+  const [la, lo] = lastHover, t = wxAt(wxg.T, la, lo), u = wxAt(wxg.U, la, lo), v = wxAt(wxg.V, la, lo);
+  const from = ((Math.atan2(-u, -v)*180/Math.PI) + 360) % 360, dirs = ['N','NE','E','SE','S','SW','W','NW'];
+  $('tip').innerHTML += `<br>≈ ${t.toFixed(1)}°C · wind ${dirs[Math.round(from/45) % 8]} ${(Math.hypot(u, v)*3.6).toFixed(0)} km/h`;
+};
 
 updateSun();
 log('<b>BOOT</b> online · click the globe for imagery, or an event for details');
